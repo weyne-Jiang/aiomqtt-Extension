@@ -53,6 +53,11 @@ elif sys.version_info >= (3, 10):
 else:
     from typing_extensions import Concatenate, Self
 
+import os
+
+if sys.platform.lower() == "win32" or os.name.lower() == "nt":
+    from asyncio import set_event_loop_policy, WindowsSelectorEventLoopPolicy
+    set_event_loop_policy(WindowsSelectorEventLoopPolicy())
 
 MQTT_LOGGER = logging.getLogger("mqtt")
 MQTT_LOGGER.setLevel(logging.WARNING)
@@ -260,6 +265,10 @@ class Client:
         self.pending_calls_threshold: int = 10
         self._misc_task: asyncio.Task[None] | None = None
 
+        # subscribe-callback map
+        self._sub_lock = asyncio.Lock()
+        self._sub_callback_map = {}
+
         # Queue that holds incoming messages
         if queue_type is None:
             queue_type = cast("type[asyncio.Queue[Message]]", asyncio.Queue)
@@ -348,6 +357,9 @@ class Client:
             timeout = 10
         self.timeout = timeout
 
+        # start message handler loop
+        asyncio.create_task(self._message_hander())
+
     @property
     def identifier(self) -> str:
         """The client's identifier.
@@ -357,10 +369,10 @@ class Client:
         """
         return self._client._client_id.decode()  # noqa: SLF001
 
-    @property
-    def messages(self) -> MessagesIterator:
-        """Dynamic view of the client's message queue."""
-        return MessagesIterator(self)
+    # @property
+    # def messages(self) -> MessagesIterator:
+    #     """Dynamic view of the client's message queue."""
+    #     return MessagesIterator(self)
 
     @property
     def _pending_calls(self) -> Generator[int, None, None]:
@@ -370,6 +382,75 @@ class Client:
         yield from self._pending_publishes.keys()
 
     @_outgoing_call
+    async def connect(self):
+        """Connect to the broker."""
+        if self._lock.locked():
+            msg = "The client context manager is reusable, but not reentrant"
+            raise MqttReentrantError(msg)
+        await self._lock.acquire()
+        try:
+            loop = asyncio.get_running_loop()
+            # [3] Run connect() within an executor thread, since it blocks on socket
+            # connection for up to `keepalive` seconds: https://git.io/Jt5Yc
+            await loop.run_in_executor(
+                None,
+                self._client.connect,
+                self._hostname,
+                self._port,
+                self._keepalive,
+                self._bind_address,
+                self._bind_port,
+                self._clean_start,
+                self._properties,
+            )
+            _set_client_socket_defaults(self._client.socket(), self._socket_options)
+        # Convert all possible paho-mqtt Client.connect exceptions to our MqttError
+        # See: https://github.com/eclipse/paho.mqtt.python/blob/v1.5.0/src/paho/mqtt/client.py#L1770
+        except (OSError, mqtt.WebsocketConnectionError) as exc:
+            self._lock.release()
+            raise MqttError(str(exc)) from None
+        try:
+            await self._wait_for(self._connected, timeout=None)
+        except MqttError:
+            # Reset state if connection attempt times out or CONNACK returns negative
+            self._lock.release()
+            self._connected = asyncio.Future()
+            raise
+        # Reset `_disconnected` if it's already in completed state after connecting
+        if self._disconnected.done():
+            self._disconnected = asyncio.Future()
+
+    @_outgoing_call
+    async def disconnect(self):
+        """Disconnect from the broker."""
+        if self._disconnected.done():
+            # Return early if the client is already disconnected
+            if self._lock.locked():
+                self._lock.release()
+            if (exc := self._disconnected.exception()) is not None:
+                # If the disconnect wasn't intentional, raise the error that caused it
+                raise exc
+            return
+        # Try to gracefully disconnect from the broker
+        rc = self._client.disconnect()
+        if rc == mqtt.MQTT_ERR_SUCCESS:
+            # Wait for acknowledgement
+            await self._wait_for(self._disconnected, timeout=None)
+            # Reset `_connected` if it's still in completed state after disconnecting
+            if self._connected.done():
+                self._connected = asyncio.Future()
+        else:
+            self._logger.warning(
+                "Could not gracefully disconnect: %d. Forcing disconnection.", rc
+            )
+        # Force disconnection if we cannot gracefully disconnect
+        if not self._disconnected.done():
+            self._disconnected.set_result(None)
+        # Release the reusability lock
+        if self._lock.locked():
+            self._lock.release()
+
+    @_outgoing_call
     async def subscribe(  # noqa: PLR0913
         self,
         /,
@@ -377,9 +458,8 @@ class Client:
         qos: int = 0,
         options: SubscribeOptions | None = None,
         properties: Properties | None = None,
-        *args: Any,
         timeout: float | None = None,
-        **kwargs: Any,
+        callback: Callable | None = None
     ) -> tuple[int, ...] | list[ReasonCode]:
         """Subscribe to a topic or wildcard.
 
@@ -396,9 +476,14 @@ class Client:
                 method.
 
         """
-        result, mid = self._client.subscribe(
-            topic, qos, options, properties, *args, **kwargs
-        )
+        if isinstance(topic, list) and callback:
+            raise NotImplementedError("Cannot specify callback for multiple topics")
+        if isinstance(topic, bytes):
+            topic = topic.decode("utf-8")
+        if topic in self._sub_callback_map:
+            raise ValueError(f"Topic {topic} is already subscribe map.")
+
+        result, mid = self._client.subscribe(topic, qos, options, properties)
         # Early out on error
         if result != mqtt.MQTT_ERR_SUCCESS or mid is None:
             raise MqttCodeError(result, "Could not subscribe to topic")
@@ -406,19 +491,32 @@ class Client:
         callback_result: asyncio.Future[tuple[int, ...] | list[ReasonCode]] = (
             asyncio.Future()
         )
+
         with self._pending_call(mid, callback_result, self._pending_subscribes):
             # Wait for callback_result
-            return await self._wait_for(callback_result, timeout=timeout)
+            res = await self._wait_for(callback_result, timeout=timeout)
 
+        # create callback for topic message arrive
+        if callback and not res[0].is_failure:
+            if isinstance(topic, str):
+                pass
+            elif isinstance(topic, tuple):
+                topic, _ = topic
+            else:
+                raise TypeError(f"Unspported topic type {type(topic)}.")
+            
+            async with self._sub_lock:
+                self._sub_callback_map[topic] = callback
+
+        return res
+        
     @_outgoing_call
     async def unsubscribe(
         self,
         /,
         topic: str | list[str],
         properties: Properties | None = None,
-        *args: Any,
-        timeout: float | None = None,
-        **kwargs: Any,
+        timeout: float | None = None
     ) -> None:
         """Unsubscribe from a topic or wildcard.
 
@@ -432,7 +530,7 @@ class Client:
             **kwargs: Additional keyword arguments to pass to paho-mqtt's unsubscribe
                 method.
         """
-        result, mid = self._client.unsubscribe(topic, properties, *args, **kwargs)
+        result, mid = self._client.unsubscribe(topic, properties)
         # Early out on error
         if result != mqtt.MQTT_ERR_SUCCESS or mid is None:
             raise MqttCodeError(result, "Could not unsubscribe from topic")
@@ -440,8 +538,15 @@ class Client:
         confirmation = asyncio.Event()
         with self._pending_call(mid, confirmation, self._pending_unsubscribes):
             # Wait for confirmation
-            await self._wait_for(confirmation.wait(), timeout=timeout)
+            res = self._wait_for(confirmation.wait(), timeout=timeout)
 
+        if not res[0].is_failure:
+            async with self._sub_lock:
+                if topic not in self._sub_callback_map:
+                    raise ValueError(f"Topic {topic} is not in subscribe map.")
+                del self._sub_callback_map[topic]
+        return res
+        
     @_outgoing_call
     async def publish(  # noqa: PLR0913
         self,
@@ -451,9 +556,7 @@ class Client:
         qos: int = 0,
         retain: bool = False,
         properties: Properties | None = None,
-        *args: Any,
-        timeout: float | None = None,
-        **kwargs: Any,
+        timeout: float | None = None
     ) -> None:
         """Publish a message to the broker.
 
@@ -471,8 +574,7 @@ class Client:
                 method.
         """
         info = self._client.publish(
-            topic, payload, qos, retain, properties, *args, **kwargs
-        )  # [2]
+            topic, payload, qos, retain, properties)  # [2]
         # Early out on error
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             raise MqttCodeError(info.rc, "Could not publish message")
@@ -616,12 +718,26 @@ class Client:
         self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage
     ) -> None:
         # Convert the paho.mqtt message into our own Message type
-        m = Message._from_paho_message(message)  # noqa: SLF001
+        # m = Message._from_paho_message(message)  # noqa: SLF001
         # Put the message in the message queue
         try:
-            self._queue.put_nowait(m)
+            self._queue.put_nowait(message)
         except asyncio.QueueFull:
             self._logger.warning("Message queue is full. Discarding message.")
+
+    async def _message_hander(self):
+        while True:
+            try:
+                message = await self._queue.get()
+                print(message)
+                async with self._sub_lock:
+                    if message.topic in self._sub_callback_map:
+                        callback = self._sub_callback_map.get(message.topic, None)
+                        if callback:
+                            asyncio.create_task(callback(message))
+
+            except asyncio.CancelledError:
+                break
 
     def _on_publish(  # noqa: PLR0913
         self,
