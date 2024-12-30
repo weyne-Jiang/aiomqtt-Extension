@@ -729,7 +729,6 @@ class Client:
         while True:
             try:
                 message = await self._queue.get()
-                print(message)
                 async with self._sub_lock:
                     if message.topic in self._sub_callback_map:
                         callback = self._sub_callback_map.get(message.topic, None)
